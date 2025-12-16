@@ -351,7 +351,7 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err er
 }
 
 func (ch *clickhouse) prefillIdlePool(ctx context.Context) (nativeTransport, error) {
-	logrus.Warn("PREFILLED POOL")
+	logrus.Fatal("PREFILLED POOL")
 	ch.prefillMu.Lock()
 	defer ch.prefillMu.Unlock()
 
