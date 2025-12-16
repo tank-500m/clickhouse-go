@@ -109,6 +109,8 @@ type clickhouse struct {
 	idle *connPool
 	open chan struct{}
 
+	prefillMu sync.Mutex
+
 	closeOnce *sync.Once
 	closed    *atomic.Bool
 }
@@ -311,7 +313,15 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err er
 	}
 
 	conn, err = ch.idle.Get(ctx)
+	if errors.Is(err, errQueueEmpty) {
+		conn, err = ch.prefillIdlePool(ctx)
+	}
+
 	if err != nil && !errors.Is(err, errQueueEmpty) {
+		select {
+		case <-ch.open:
+		default:
+		}
 		return nil, err
 	}
 
@@ -337,6 +347,41 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err er
 	conn.debugf("[acquired new]")
 	return conn, nil
 
+}
+
+func (ch *clickhouse) prefillIdlePool(ctx context.Context) (nativeTransport, error) {
+	ch.prefillMu.Lock()
+	defer ch.prefillMu.Unlock()
+
+	conn, err := ch.idle.Get(ctx)
+	if err == nil || !errors.Is(err, errQueueEmpty) {
+		return conn, err
+	}
+
+	slots := ch.idle.Cap() - ch.idle.Len()
+	if slots <= 0 {
+		return nil, errQueueEmpty
+	}
+
+	target := slots
+	if ch.opt.MaxOpenConns > 0 && target > ch.opt.MaxOpenConns {
+		target = ch.opt.MaxOpenConns
+	}
+
+	for i := 0; i < target; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, context.Cause(ctx)
+		}
+
+		c, dialErr := ch.dial(ctx)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+
+		ch.idle.Put(c)
+	}
+
+	return ch.idle.Get(ctx)
 }
 
 func (ch *clickhouse) release(conn nativeTransport, err error) {

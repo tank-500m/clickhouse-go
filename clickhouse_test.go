@@ -104,17 +104,21 @@ func TestAcquire_NewConnection(t *testing.T) {
 		t.Fatal("expected connection, got nil")
 	}
 
-	if dialCount.Load() != 1 {
-		t.Errorf("expected 1 dial call, got %d", dialCount.Load())
+	if dialCount.Load() != int32(ch.opt.MaxIdleConns) {
+		t.Errorf("expected %d dial calls to prefill idle pool, got %d", ch.opt.MaxIdleConns, dialCount.Load())
 	}
 
 	if transport.isReleased() {
 		t.Error("newly acquired connection should not be marked as released")
 	}
+
+	if ch.idle.Len() != ch.opt.MaxIdleConns-1 {
+		t.Errorf("expected idle pool to hold %d connections after first acquire, got %d", ch.opt.MaxIdleConns-1, ch.idle.Len())
+	}
 }
 
-// TestAcquire_ReuseIdleConnection tests reusing a healthy idle connection
-func TestAcquire_ReuseIdleConnection(t *testing.T) {
+// TestAcquire_RotateIdleConnection ensures pooled connections are rotated when prefilled
+func TestAcquire_RotateIdleConnection(t *testing.T) {
 	dialCount := atomic.Int32{}
 
 	conn, err := Open(&Options{
@@ -148,12 +152,12 @@ func TestAcquire_ReuseIdleConnection(t *testing.T) {
 		t.Fatalf("second acquire failed: %v", err)
 	}
 
-	if dialCount.Load() != 1 {
-		t.Errorf("expected 1 dial call (reused connection), got %d", dialCount.Load())
+	if dialCount.Load() != int32(ch.opt.MaxIdleConns) {
+		t.Errorf("expected %d dial calls to prefill pool, got %d", ch.opt.MaxIdleConns, dialCount.Load())
 	}
 
-	if conn1.connID() != conn2.connID() {
-		t.Error("expected same connection to be reused")
+	if conn1.connID() == conn2.connID() {
+		t.Error("expected rotation through prefilled idle connections")
 	}
 }
 
@@ -375,8 +379,8 @@ func TestRelease_HealthyConnection(t *testing.T) {
 		t.Error("connection should be marked as released")
 	}
 
-	if ch.idle.Len() != 1 {
-		t.Errorf("expected 1 connection in idle pool, got %d", ch.idle.Len())
+	if ch.idle.Len() != ch.opt.MaxIdleConns {
+		t.Errorf("expected %d connections in idle pool, got %d", ch.opt.MaxIdleConns, ch.idle.Len())
 	}
 
 	mock := transport.(*mockTransport)
@@ -416,7 +420,7 @@ func TestRelease_WithError(t *testing.T) {
 		t.Error("connection with error should be closed")
 	}
 
-	if ch.idle.Len() != 0 {
+	if ch.idle.Len() != ch.opt.MaxIdleConns-1 {
 		t.Errorf("connection with error should not be returned to pool, got %d in pool", ch.idle.Len())
 	}
 }
@@ -487,8 +491,8 @@ func TestRelease_DoubleRelease(t *testing.T) {
 	ch.release(transport, nil)
 	ch.release(transport, nil) // Second release should be no-op
 
-	if ch.idle.Len() != 1 {
-		t.Errorf("expected 1 connection in idle pool after double release, got %d", ch.idle.Len())
+	if ch.idle.Len() != ch.opt.MaxIdleConns {
+		t.Errorf("expected %d connections in idle pool after double release, got %d", ch.opt.MaxIdleConns, ch.idle.Len())
 	}
 }
 
@@ -581,7 +585,6 @@ func TestAcquireRelease_Cycle(t *testing.T) {
 
 	ch := conn.(*clickhouse)
 
-	// First cycle
 	conn1, err := ch.acquire(context.Background())
 	if err != nil {
 		t.Fatalf("first acquire failed: %v", err)
@@ -589,18 +592,29 @@ func TestAcquireRelease_Cycle(t *testing.T) {
 	firstID := conn1.connID()
 	ch.release(conn1, nil)
 
-	// Second cycle - should reuse
 	conn2, err := ch.acquire(context.Background())
 	if err != nil {
 		t.Fatalf("second acquire failed: %v", err)
 	}
+	secondID := conn2.connID()
+	ch.release(conn2, nil)
 
-	if conn2.connID() != firstID {
-		t.Error("expected same connection to be reused")
+	conn3, err := ch.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("third acquire failed: %v", err)
+	}
+	thirdID := conn3.connID()
+	ch.release(conn3, nil)
+
+	if secondID == firstID {
+		t.Error("expected second acquire to rotate to a different prefilled connection")
+	}
+	if thirdID != firstID {
+		t.Error("expected rotation to wrap back to the first connection")
 	}
 
-	if dialCount.Load() != 1 {
-		t.Errorf("expected only 1 dial for reused connection, got %d", dialCount.Load())
+	if dialCount.Load() != int32(ch.opt.MaxIdleConns) {
+		t.Errorf("expected %d dials during initial prefill, got %d", ch.opt.MaxIdleConns, dialCount.Load())
 	}
 }
 
@@ -693,12 +707,8 @@ func TestAcquireRelease_PoolSaturation(t *testing.T) {
 	ch.release(conns[0], nil)
 
 	// Should now be able to acquire again
-	transport, err := ch.acquire(context.Background())
+	_, err = ch.acquire(context.Background())
 	if err != nil {
 		t.Fatalf("acquire after release failed: %v", err)
-	}
-
-	if transport.connID() != conns[0].connID() {
-		t.Error("expected to reuse released connection")
 	}
 }

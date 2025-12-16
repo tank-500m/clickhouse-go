@@ -31,7 +31,9 @@ func TestCustomDialContext(t *testing.T) {
 		tlsConfig = &tls.Config{}
 	}
 	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{fmt.Sprintf("%s:%d", env.Host, port)},
+		Addr:         []string{fmt.Sprintf("%s:%d", env.Host, port)},
+		MaxIdleConns: 1,
+		MaxOpenConns: 1,
 		Auth: clickhouse.Auth{
 			Database: "default",
 			Username: env.Username,
@@ -81,8 +83,10 @@ func TestCustomHTTPDialContext(t *testing.T) {
 		tlsConfig = &tls.Config{}
 	}
 	connector := clickhouse.Connector(&clickhouse.Options{
-		Addr:     []string{fmt.Sprintf("%s:%d", env.Host, port)},
-		Protocol: clickhouse.HTTP,
+		Addr:         []string{fmt.Sprintf("%s:%d", env.Host, port)},
+		Protocol:     clickhouse.HTTP,
+		MaxIdleConns: 1,
+		MaxOpenConns: 1,
 		Auth: clickhouse.Auth{
 			Database: "default",
 			Username: env.Username,
