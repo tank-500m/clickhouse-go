@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/sirupsen/logrus"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -351,7 +350,6 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err er
 }
 
 func (ch *clickhouse) prefillIdlePool(ctx context.Context) (nativeTransport, error) {
-	logrus.Fatal("PREFILLED POOL")
 	ch.prefillMu.Lock()
 	defer ch.prefillMu.Unlock()
 
