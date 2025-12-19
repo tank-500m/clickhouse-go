@@ -363,9 +363,14 @@ func (ch *clickhouse) prefillIdlePool(ctx context.Context) (nativeTransport, err
 		return nil, errQueueEmpty
 	}
 
+	maxOpenAvailable := ch.opt.MaxOpenConns - len(ch.open) + 1
+	if maxOpenAvailable <= 0 {
+		return nil, errQueueEmpty
+	}
+
 	target := slots
-	if ch.opt.MaxOpenConns > 0 && target > ch.opt.MaxOpenConns {
-		target = ch.opt.MaxOpenConns
+	if target > maxOpenAvailable {
+		target = maxOpenAvailable
 	}
 
 	for i := 0; i < target; i++ {
