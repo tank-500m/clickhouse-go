@@ -177,8 +177,8 @@ The following connection settings are available in both DSN strings and the `cli
 ### Connection Strategy
 * **connection_open_strategy** - Strategy for selecting servers from the connection pool:
   * `in_order` - Choose the first available server in the specified order (default)
-  * `round_robin` - Choose servers in a round-robin fashion
-  * `random` - Choose a random server from the pool
+  * `round_robin` - Choose servers in a round-robin fashion and pre-open connections (up to `min(max_open_conns, max_idle_conns)`) so sequential queries are balanced across hosts
+  * `random` - Choose a random server from the pool; multiple hosts will be opened eagerly to randomize requests
 
 ### Compression Settings
 * **compress** - Enable compression with a specific algorithm: `none`, `zstd`, `lz4`, `lz4hc`, `gzip`, `deflate`, `br`. If set to `true`, `lz4` will be used (default: `none`)
