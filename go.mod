@@ -77,5 +77,3 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/ClickHouse/ch-go => github.com/tank-500m/ch-go v0.0.0-20251212073442-446234014865

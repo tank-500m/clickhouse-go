@@ -296,26 +296,13 @@ func DefaultDialStrategy(ctx context.Context, connID int, opt *Options, dial Dia
 	return r, err
 }
 
-func (ch *clickhouse) desiredPoolSize() int {
-	if ch.idle == nil {
-		return 0
-	}
-
-	target := ch.idle.Cap()
-	if max := ch.opt.MaxOpenConns; max > 0 && max < target {
-		target = max
-	}
-	return target
-}
-
 func (ch *clickhouse) shouldDialForStrategy(currentConns int) bool {
-
 	if ch.opt.ConnOpenStrategy == ConnOpenInOrder {
 		return false
 	}
 
-	target := ch.desiredPoolSize()
-	return target > 1 && currentConns < target
+	maxIdle := ch.opt.MaxIdleConns
+	return maxIdle > 1 && currentConns < maxIdle
 }
 
 func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err error) {
@@ -332,9 +319,7 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err er
 		return nil, context.Cause(ctx)
 	}
 
-	currentConns := len(ch.open)
-
-	if ch.shouldDialForStrategy(currentConns) {
+	if ch.shouldDialForStrategy(len(ch.open)) {
 		if conn, err = ch.dial(ctx); err == nil {
 			conn.debugf("[acquired new]")
 			return conn, nil
