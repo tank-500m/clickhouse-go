@@ -177,3 +177,67 @@ func (i *connPool) isExpired(conn nativeTransport) bool {
 func (i *connPool) expires(conn nativeTransport) time.Time {
 	return conn.connectedAtTime().Add(i.maxConnLifetime)
 }
+
+func newIdlePools(lifetime time.Duration, maxIdle int, addrs []string) map[string]*connPool {
+	caps := idleCapacitiesByAddr(addrs, maxIdle)
+	pools := make(map[string]*connPool, len(caps))
+	for addr, cap := range caps {
+		if cap <= 0 {
+			continue
+		}
+		pools[addr] = newConnPool(lifetime, cap)
+	}
+	return pools
+}
+
+func idlePoolsStats(pools map[string]*connPool) (int, int) {
+	var (
+		totalLen int
+		totalCap int
+	)
+	for _, pool := range pools {
+		totalLen += pool.Len()
+		totalCap += pool.Cap()
+	}
+	return totalLen, totalCap
+}
+
+func closeIdlePools(pools map[string]*connPool) error {
+	var firstErr error
+	for _, pool := range pools {
+		if err := pool.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func idleCapacitiesByAddr(addrs []string, maxIdle int) map[string]int {
+	caps := make(map[string]int, len(addrs))
+	if maxIdle <= 0 || len(addrs) == 0 {
+		return caps
+	}
+
+	totalAddrs := len(addrs)
+	perAddr := make([]int, totalAddrs)
+	switch {
+	case maxIdle < totalAddrs:
+		for i := 0; i < maxIdle; i++ {
+			perAddr[i] = 1
+		}
+	default:
+		base := maxIdle / totalAddrs
+		extra := maxIdle % totalAddrs
+		for i := 0; i < totalAddrs; i++ {
+			perAddr[i] = base
+			if i < extra {
+				perAddr[i]++
+			}
+		}
+	}
+
+	for i, addr := range addrs {
+		caps[addr] += perAddr[i]
+	}
+	return caps
+}

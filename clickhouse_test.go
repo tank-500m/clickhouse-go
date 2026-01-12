@@ -86,7 +86,7 @@ func TestAcquire_NewConnection(t *testing.T) {
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
 			dialCount.Add(1)
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -125,7 +125,7 @@ func TestAcquire_ReuseIdleConnection(t *testing.T) {
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
 			dialCount.Add(1)
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -157,10 +157,11 @@ func TestAcquire_ReuseIdleConnection(t *testing.T) {
 	}
 }
 
-// TestAcquire_RoundRobinCreatesPoolForLoadBalancing testing round robin dials new connections
-// until the idle pool is filled.
+// TestAcquire_RoundRobinCreatesPoolForLoadBalancing verifies round robin dials once per address
+// and reuses pooled connections afterward.
 func TestAcquire_RoundRobinCreatesPoolForLoadBalancing(t *testing.T) {
 	dialCount := atomic.Int32{}
+	dialed := make([]string, 0, 2)
 
 	conn, err := Open(&Options{
 		Addr:             []string{"localhost:9000", "localhost:9001"},
@@ -171,7 +172,9 @@ func TestAcquire_RoundRobinCreatesPoolForLoadBalancing(t *testing.T) {
 		ConnOpenStrategy: ConnOpenRoundRobin,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
 			dialCount.Add(1)
-			return DialResult{conn: newMockTransport(connID)}, nil
+			addr := opt.Addr[0]
+			dialed = append(dialed, addr)
+			return DialResult{conn: newMockTransportWithAddr(connID, addr)}, nil
 		},
 	})
 	if err != nil {
@@ -181,7 +184,7 @@ func TestAcquire_RoundRobinCreatesPoolForLoadBalancing(t *testing.T) {
 
 	ch := conn.(*clickhouse)
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 2; i++ {
 		transport, err := ch.acquire(context.Background())
 		if err != nil {
 			t.Fatalf("acquire %d failed: %v", i+1, err)
@@ -189,76 +192,32 @@ func TestAcquire_RoundRobinCreatesPoolForLoadBalancing(t *testing.T) {
 		ch.release(transport, nil)
 	}
 
-	if got := dialCount.Load(); got != 4 {
-		t.Fatalf("expected 4 dial calls while filling pool, got %d", got)
+	if got := dialCount.Load(); got != 2 {
+		t.Fatalf("expected 2 dial calls (one per address), got %d", got)
+	}
+	if len(dialed) != 2 || dialed[0] == dialed[1] {
+		t.Fatalf("expected both addresses to be dialed, got %v", dialed)
 	}
 
-	transport, err := ch.acquire(context.Background())
-	if err != nil {
-		t.Fatalf("acquire after warmup failed: %v", err)
+	gotOrder := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		transport, err := ch.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire after warmup failed: %v", err)
+		}
+		gotOrder = append(gotOrder, transport.addr())
+		ch.release(transport, nil)
 	}
 
-	// After warmup, round robin should reuse idle connections.
-	if dialCount.Load() != 4 {
-		t.Fatalf("expected to reuse pooled connection after warmup, got %d dials", dialCount.Load())
-	}
-	if transport.connID() != 1 {
-		t.Fatalf("expected to reuse first pooled connection, got id %d", transport.connID())
-	}
-	ch.release(transport, nil)
-}
-
-// TestAcquire_ShouldDialForStrategyLimitsConcurrentDials testing concurrent callers are capped by max idle.
-func TestAcquire_ShouldDialForStrategyLimitsConcurrentDials(t *testing.T) {
-	conn, err := Open(&Options{
-		Addr:             []string{"localhost:9000"},
-		DialTimeout:      time.Second,
-		MaxOpenConns:     10,
-		MaxIdleConns:     2,
-		ConnMaxLifetime:  time.Hour,
-		ConnOpenStrategy: ConnOpenRoundRobin,
-	})
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer conn.Close()
-
-	ch := conn.(*clickhouse)
-
-	const callers = 10
-	start := make(chan struct{})
-	hold := make(chan struct{})
-	var (
-		wg        sync.WaitGroup
-		attempted sync.WaitGroup
-		allowed   atomic.Int32
-	)
-
-	wg.Add(callers)
-	attempted.Add(callers)
-	for i := 0; i < callers; i++ {
-		go func() {
-			defer wg.Done()
-			<-start
-
-			ok := ch.shouldDialForStrategy(1)
-			attempted.Done()
-
-			if ok {
-				allowed.Add(1)
-				<-hold
-				ch.strategyDialing.Add(-1)
-			}
-		}()
+	if dialCount.Load() != 2 {
+		t.Fatalf("expected to reuse pooled connections after warmup, got %d dials", dialCount.Load())
 	}
 
-	close(start)
-	attempted.Wait()
-	close(hold)
-	wg.Wait()
-
-	if got := allowed.Load(); got != int32(ch.opt.MaxIdleConns) {
-		t.Fatalf("expected %d concurrent dials, got %d", ch.opt.MaxIdleConns, got)
+	expected := []string{"localhost:9000", "localhost:9001", "localhost:9000", "localhost:9001"}
+	for i, addr := range expected {
+		if gotOrder[i] != addr {
+			t.Fatalf("expected round robin order %v, got %v", expected, gotOrder)
+		}
 	}
 }
 
@@ -276,7 +235,7 @@ func TestAcquire_BadConnection(t *testing.T) {
 		DialStrategy: func(ctx context.Context, id int, opt *Options, dial Dial) (DialResult, error) {
 			dialCount.Add(1)
 			nextID := int(connID.Add(1))
-			return DialResult{conn: newMockTransport(nextID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(nextID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -327,7 +286,7 @@ func TestAcquire_MaxOpenConnsLimit(t *testing.T) {
 		MaxIdleConns:    1,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -414,6 +373,60 @@ func TestAcquire_DialFailure(t *testing.T) {
 	}
 }
 
+// TestAcquire_DialFailureBackoffSkipsAddress verifies cooldown skips repeat dials for a failing address.
+func TestAcquire_DialFailureBackoffSkipsAddress(t *testing.T) {
+	dialErr := errors.New("dial failed")
+	dialCounts := map[string]int{}
+	var dialMu sync.Mutex
+
+	conn, err := Open(&Options{
+		Addr:             []string{"localhost:9000", "localhost:9001"},
+		DialTimeout:      time.Second,
+		DialFailBackoff:  time.Second,
+		MaxOpenConns:     2,
+		MaxIdleConns:     2,
+		ConnMaxLifetime:  time.Hour,
+		ConnOpenStrategy: ConnOpenInOrder,
+		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
+			addr := opt.Addr[0]
+			dialMu.Lock()
+			dialCounts[addr]++
+			dialMu.Unlock()
+			if addr == "localhost:9000" {
+				return DialResult{}, dialErr
+			}
+			return DialResult{conn: newMockTransportWithAddr(connID, addr)}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer conn.Close()
+
+	ch := conn.(*clickhouse)
+
+	first, err := ch.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("first acquire failed: %v", err)
+	}
+	ch.release(first, nil)
+
+	second, err := ch.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("second acquire failed: %v", err)
+	}
+	ch.release(second, nil)
+
+	dialMu.Lock()
+	defer dialMu.Unlock()
+	if got := dialCounts["localhost:9000"]; got != 1 {
+		t.Fatalf("expected 1 dial attempt for failing address, got %d", got)
+	}
+	if got := dialCounts["localhost:9001"]; got != 1 {
+		t.Fatalf("expected 1 dial attempt for healthy address, got %d", got)
+	}
+}
+
 // TestAcquire_ContextCancellation tests context cancellation during acquire
 func TestAcquire_ContextCancellation(t *testing.T) {
 	conn, err := Open(&Options{
@@ -423,7 +436,7 @@ func TestAcquire_ContextCancellation(t *testing.T) {
 		MaxIdleConns:    1,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -459,7 +472,7 @@ func TestRelease_HealthyConnection(t *testing.T) {
 		MaxIdleConns:    2,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -480,8 +493,8 @@ func TestRelease_HealthyConnection(t *testing.T) {
 		t.Error("connection should be marked as released")
 	}
 
-	if ch.idle.Len() != 1 {
-		t.Errorf("expected 1 connection in idle pool, got %d", ch.idle.Len())
+	if idleLen(ch) != 1 {
+		t.Errorf("expected 1 connection in idle pool, got %d", idleLen(ch))
 	}
 
 	mock := transport.(*mockTransport)
@@ -499,7 +512,7 @@ func TestRelease_WithError(t *testing.T) {
 		MaxIdleConns:    2,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -521,8 +534,8 @@ func TestRelease_WithError(t *testing.T) {
 		t.Error("connection with error should be closed")
 	}
 
-	if ch.idle.Len() != 0 {
-		t.Errorf("connection with error should not be returned to pool, got %d in pool", ch.idle.Len())
+	if idleLen(ch) != 0 {
+		t.Errorf("connection with error should not be returned to pool, got %d in pool", idleLen(ch))
 	}
 }
 
@@ -536,7 +549,7 @@ func TestRelease_ExpiredConnection(t *testing.T) {
 		ConnMaxLifetime: 10 * time.Millisecond,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
 			// Create a connection with old timestamp
-			mock := newMockTransport(connID)
+			mock := newMockTransportWithAddr(connID, opt.Addr[0])
 			mock.connectedAt = time.Now().Add(-100 * time.Millisecond)
 			return DialResult{conn: mock}, nil
 		},
@@ -560,8 +573,8 @@ func TestRelease_ExpiredConnection(t *testing.T) {
 		t.Error("expired connection should be closed")
 	}
 
-	if ch.idle.Len() != 0 {
-		t.Errorf("expired connection should not be returned to pool, got %d in pool", ch.idle.Len())
+	if idleLen(ch) != 0 {
+		t.Errorf("expired connection should not be returned to pool, got %d in pool", idleLen(ch))
 	}
 }
 
@@ -574,7 +587,7 @@ func TestRelease_DoubleRelease(t *testing.T) {
 		MaxIdleConns:    2,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -592,8 +605,8 @@ func TestRelease_DoubleRelease(t *testing.T) {
 	ch.release(transport, nil)
 	ch.release(transport, nil) // Second release should be no-op
 
-	if ch.idle.Len() != 1 {
-		t.Errorf("expected 1 connection in idle pool after double release, got %d", ch.idle.Len())
+	if idleLen(ch) != 1 {
+		t.Errorf("expected 1 connection in idle pool after double release, got %d", idleLen(ch))
 	}
 }
 
@@ -607,7 +620,7 @@ func TestRelease_FreeBufOnConnRelease(t *testing.T) {
 		ConnMaxLifetime:      time.Hour,
 		FreeBufOnConnRelease: true,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -639,7 +652,7 @@ func TestRelease_WhenPoolClosed(t *testing.T) {
 		MaxIdleConns:    2,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -676,7 +689,7 @@ func TestAcquireRelease_Cycle(t *testing.T) {
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
 			dialCount.Add(1)
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -721,7 +734,7 @@ func TestAcquireRelease_Concurrent(t *testing.T) {
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, id int, opt *Options, dial Dial) (DialResult, error) {
 			nextID := int(connID.Add(1))
-			return DialResult{conn: newMockTransport(nextID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(nextID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -774,7 +787,7 @@ func TestAcquireRelease_PoolSaturation(t *testing.T) {
 		MaxIdleConns:    2,
 		ConnMaxLifetime: time.Hour,
 		DialStrategy: func(ctx context.Context, connID int, opt *Options, dial Dial) (DialResult, error) {
-			return DialResult{conn: newMockTransport(connID)}, nil
+			return DialResult{conn: newMockTransportWithAddr(connID, opt.Addr[0])}, nil
 		},
 	})
 	if err != nil {
@@ -806,4 +819,12 @@ func TestAcquireRelease_PoolSaturation(t *testing.T) {
 	if transport.connID() != conns[0].connID() {
 		t.Error("expected to reuse released connection")
 	}
+}
+
+func idleLen(ch *clickhouse) int {
+	total := 0
+	for _, pool := range ch.idle {
+		total += pool.Len()
+	}
+	return total
 }

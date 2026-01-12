@@ -126,6 +126,7 @@ type Options struct {
 	Settings             Settings
 	Compression          *Compression
 	DialTimeout          time.Duration // default 30 second
+	DialFailBackoff      time.Duration // per-address cooldown after dial failure, 0 disables
 	MaxOpenConns         int           // default MaxIdleConns + 5
 	MaxIdleConns         int           // default 5
 	ConnMaxLifetime      time.Duration // default 1 hour
@@ -233,6 +234,12 @@ func (o *Options) fromDSN(in string) error {
 				return fmt.Errorf("clickhouse [dsn parse]: dial timeout: %s", err)
 			}
 			o.DialTimeout = duration
+		case "dial_fail_backoff":
+			duration, err := time.ParseDuration(params.Get(v))
+			if err != nil {
+				return fmt.Errorf("clickhouse [dsn parse]: dial_fail_backoff: %s", err)
+			}
+			o.DialFailBackoff = duration
 		case "block_buffer_size":
 			if blockBufferSize, err := strconv.ParseUint(params.Get(v), 10, 8); err == nil {
 				if blockBufferSize <= 0 {

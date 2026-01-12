@@ -77,6 +77,7 @@ func dial(ctx context.Context, addr string, num int, opt *Options) (*connect, er
 
 	var (
 		connect = &connect{
+			address:              addr,
 			id:                   num,
 			opt:                  opt,
 			conn:                 conn,
@@ -125,6 +126,7 @@ func dial(ctx context.Context, addr string, num int, opt *Options) (*connect, er
 
 // https://github.com/ClickHouse/ClickHouse/blob/master/src/Client/Connection.cpp
 type connect struct {
+	address              string
 	id                   int
 	opt                  *Options
 	conn                 net.Conn
@@ -152,6 +154,10 @@ func (c *connect) debugf(format string, v ...any) {
 
 func (c *connect) connID() int {
 	return c.id
+}
+
+func (c *connect) addr() string {
+	return c.address
 }
 
 func (c *connect) connectedAtTime() time.Time {

@@ -470,6 +470,7 @@ func TestConnPool_FIFOOrdering(t *testing.T) {
 type mockTransport struct {
 	connectedAt   time.Time
 	id            int
+	address       string
 	released      bool
 	closed        bool
 	bad           bool
@@ -516,6 +517,10 @@ func (m *mockTransport) connID() int {
 	return m.id
 }
 
+func (m *mockTransport) addr() string {
+	return m.address
+}
+
 func (m *mockTransport) connectedAtTime() time.Time {
 	return m.connectedAt
 }
@@ -556,6 +561,14 @@ func newMockTransport(id int) *mockTransport {
 	return &mockTransport{
 		connectedAt: time.Now(),
 		id:          id,
+	}
+}
+
+func newMockTransportWithAddr(id int, addr string) *mockTransport {
+	return &mockTransport{
+		connectedAt: time.Now(),
+		id:          id,
+		address:     addr,
 	}
 }
 

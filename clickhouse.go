@@ -68,12 +68,18 @@ func Open(opt *Options) (driver.Conn, error) {
 	}
 	o := opt.setDefaults()
 
+	var addrCooldown map[string]time.Time
+	if o.DialFailBackoff > 0 {
+		addrCooldown = make(map[string]time.Time, len(o.Addr))
+	}
+
 	conn := &clickhouse{
-		opt:       o,
-		idle:      newConnPool(o.ConnMaxLifetime, o.MaxIdleConns),
-		open:      make(chan struct{}, o.MaxOpenConns),
-		closeOnce: &sync.Once{},
-		closed:    &atomic.Bool{},
+		opt:          o,
+		idle:         newIdlePools(o.ConnMaxLifetime, o.MaxIdleConns, o.Addr),
+		open:         make(chan struct{}, o.MaxOpenConns),
+		closeOnce:    &sync.Once{},
+		closed:       &atomic.Bool{},
+		addrCooldown: addrCooldown,
 	}
 
 	return conn, nil
@@ -91,6 +97,7 @@ type nativeTransport interface {
 	ping(context.Context) error
 	isBad() bool
 	connID() int
+	addr() string
 	connectedAtTime() time.Time
 	isReleased() bool
 	setReleased(released bool)
@@ -106,13 +113,15 @@ type clickhouse struct {
 	opt    *Options
 	connID int64
 
-	idle *connPool
-	open chan struct{}
+	addrIndex atomic.Uint64
+	idle      map[string]*connPool
+	open      chan struct{}
 
 	closeOnce *sync.Once
 	closed    *atomic.Bool
 
-	strategyDialing atomic.Int32
+	addrCooldownMu sync.Mutex
+	addrCooldown   map[string]time.Time
 }
 
 func (clickhouse) Contributors() []string {
@@ -232,18 +241,22 @@ func (ch *clickhouse) Ping(ctx context.Context) (err error) {
 }
 
 func (ch *clickhouse) Stats() driver.Stats {
+	idleLen, idleCap := idlePoolsStats(ch.idle)
 	return driver.Stats{
 		Open:         len(ch.open),
 		MaxOpenConns: cap(ch.open),
 
-		Idle:         ch.idle.Len(),
-		MaxIdleConns: ch.idle.Cap(),
+		Idle:         idleLen,
+		MaxIdleConns: idleCap,
 	}
 }
 
-func (ch *clickhouse) dial(ctx context.Context) (conn nativeTransport, err error) {
+func (ch *clickhouse) dialAddr(ctx context.Context, addr string) (conn nativeTransport, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if addr == "" {
+		return nil, ErrAcquireConnNoAddress
 	}
 
 	connID := int(atomic.AddInt64(&ch.connID, 1))
@@ -266,9 +279,14 @@ func (ch *clickhouse) dial(ctx context.Context) (conn nativeTransport, err error
 		dialStrategy = ch.opt.DialStrategy
 	}
 
-	result, err := dialStrategy(ctx, connID, ch.opt, dialFunc)
+	opt := *ch.opt
+	opt.Addr = []string{addr}
+	result, err := dialStrategy(ctx, connID, &opt, dialFunc)
 	if err != nil {
 		return nil, err
+	}
+	if result.conn == nil {
+		return nil, errors.New("clickhouse: dial strategy returned nil connection")
 	}
 	return result.conn, nil
 }
@@ -298,32 +316,6 @@ func DefaultDialStrategy(ctx context.Context, connID int, opt *Options, dial Dia
 	return r, err
 }
 
-func (ch *clickhouse) shouldDialForStrategy(currentConns int) bool {
-	if ch.opt.ConnOpenStrategy == ConnOpenInOrder {
-		return false
-	}
-
-	maxIdle := ch.opt.MaxIdleConns
-	if maxIdle <= 1 {
-		return false
-	}
-
-	inUse := currentConns
-	if inUse > 0 {
-		inUse--
-	}
-
-	for {
-		dialing := int(ch.strategyDialing.Load())
-		if inUse+ch.idle.Len()+dialing >= maxIdle {
-			return false
-		}
-		if ch.strategyDialing.CompareAndSwap(int32(dialing), int32(dialing+1)) {
-			return true
-		}
-	}
-}
-
 func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err error) {
 	if ch.closed.Load() {
 		return nil, ErrConnectionClosed
@@ -338,42 +330,155 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn nativeTransport, err er
 		return nil, context.Cause(ctx)
 	}
 
-	if ch.shouldDialForStrategy(len(ch.open)) {
-		conn, err = ch.dial(ctx)
-		ch.strategyDialing.Add(-1)
-		if err == nil {
+	addrs := ch.opt.Addr
+	if len(addrs) == 0 {
+		ch.releaseOpenSlot()
+		return nil, ErrAcquireConnNoAddress
+	}
+
+	start := ch.addrStart()
+	var (
+		lastErr       error
+		earliestAddr  string
+		earliestRetry time.Time
+		dialAttempted bool
+	)
+	now := time.Now()
+	for i := 0; i < len(addrs); i++ {
+		addr := addrs[(start+i)%len(addrs)]
+		conn, err = ch.getFromPool(ctx, ch.idle[addr])
+		if err == nil && conn != nil {
+			return conn, nil
+		}
+		if err != nil && !errors.Is(err, errQueueEmpty) {
+			lastErr = err
+			break
+		}
+
+		allowed, retryAt := ch.dialAllowed(addr, now)
+		if !allowed {
+			if earliestAddr == "" || retryAt.Before(earliestRetry) {
+				earliestAddr = addr
+				earliestRetry = retryAt
+			}
+			continue
+		}
+
+		dialAttempted = true
+		if conn, err = ch.dialAddr(ctx, addr); err == nil {
+			ch.recordDialSuccess(addr)
 			conn.debugf("[acquired new]")
 			return conn, nil
 		}
+		ch.recordDialFailure(addr)
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
-	conn, err = ch.idle.Get(ctx)
-	if err != nil && !errors.Is(err, errQueueEmpty) {
-		return nil, err
-	}
-
-	if err == nil && conn != nil {
-		if !conn.isBad() {
-			conn.setReleased(false)
-			conn.debugf("[acquired from pool]")
+	if lastErr == nil && !dialAttempted && earliestAddr != "" && ctx.Err() == nil {
+		if conn, err = ch.dialAddr(ctx, earliestAddr); err == nil {
+			ch.recordDialSuccess(earliestAddr)
+			conn.debugf("[acquired new]")
 			return conn, nil
 		}
-
-		conn.close()
+		ch.recordDialFailure(earliestAddr)
+		lastErr = err
 	}
 
-	if conn, err = ch.dial(ctx); err != nil {
-		select {
-		case <-ch.open:
-		default:
+	ch.releaseOpenSlot()
+	if lastErr == nil {
+		lastErr = ErrAcquireConnNoAddress
+	}
+	return nil, lastErr
+}
+
+func (ch *clickhouse) addrStart() int {
+	switch ch.opt.ConnOpenStrategy {
+	case ConnOpenRoundRobin:
+		return int(ch.addrIndex.Add(1) - 1)
+	case ConnOpenRandom:
+		return rand.Int()
+	default:
+		return 0
+	}
+}
+
+func (ch *clickhouse) dialAllowed(addr string, now time.Time) (bool, time.Time) {
+	if ch.opt.DialFailBackoff <= 0 {
+		return true, time.Time{}
+	}
+
+	ch.addrCooldownMu.Lock()
+	defer ch.addrCooldownMu.Unlock()
+	if ch.addrCooldown == nil {
+		ch.addrCooldown = make(map[string]time.Time, len(ch.opt.Addr))
+		return true, time.Time{}
+	}
+
+	nextRetry, ok := ch.addrCooldown[addr]
+	if !ok || !now.Before(nextRetry) {
+		delete(ch.addrCooldown, addr)
+		return true, time.Time{}
+	}
+
+	return false, nextRetry
+}
+
+func (ch *clickhouse) recordDialFailure(addr string) {
+	if ch.opt.DialFailBackoff <= 0 {
+		return
+	}
+
+	ch.addrCooldownMu.Lock()
+	if ch.addrCooldown == nil {
+		ch.addrCooldown = make(map[string]time.Time, len(ch.opt.Addr))
+	}
+	ch.addrCooldown[addr] = time.Now().Add(ch.opt.DialFailBackoff)
+	ch.addrCooldownMu.Unlock()
+}
+
+func (ch *clickhouse) recordDialSuccess(addr string) {
+	if ch.opt.DialFailBackoff <= 0 {
+		return
+	}
+
+	ch.addrCooldownMu.Lock()
+	if ch.addrCooldown != nil {
+		delete(ch.addrCooldown, addr)
+	}
+	ch.addrCooldownMu.Unlock()
+}
+
+func (ch *clickhouse) getFromPool(ctx context.Context, pool *connPool) (nativeTransport, error) {
+	if pool == nil {
+		return nil, errQueueEmpty
+	}
+
+	for {
+		conn, err := pool.Get(ctx)
+		if err != nil {
+			return nil, err
 		}
-
-		return nil, err
+		if conn == nil {
+			return nil, errQueueEmpty
+		}
+		if conn.isBad() {
+			conn.close()
+			continue
+		}
+		conn.setReleased(false)
+		conn.debugf("[acquired from pool]")
+		return conn, nil
 	}
+}
 
-	conn.debugf("[acquired new]")
-	return conn, nil
-
+func (ch *clickhouse) releaseOpenSlot() {
+	select {
+	case <-ch.open:
+	default:
+	}
 }
 
 func (ch *clickhouse) release(conn nativeTransport, err error) {
@@ -413,12 +518,17 @@ func (ch *clickhouse) release(conn nativeTransport, err error) {
 		return
 	}
 
-	ch.idle.Put(conn)
+	if pool, ok := ch.idle[conn.addr()]; ok {
+		pool.Put(conn)
+		return
+	}
+
+	conn.close()
 }
 
 func (ch *clickhouse) Close() (err error) {
 	ch.closeOnce.Do(func() {
-		err = ch.idle.Close()
+		err = closeIdlePools(ch.idle)
 		ch.closed.Store(true)
 	})
 

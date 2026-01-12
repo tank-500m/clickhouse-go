@@ -210,6 +210,7 @@ func dialHttp(ctx context.Context, addr string, num int, opt *Options) (*httpCon
 	}
 
 	conn := httpConnect{
+		address:     addr,
 		id:          num,
 		connectedAt: time.Now(),
 		released:    false,
@@ -271,6 +272,7 @@ func createHTTPRoundTripper(opt *Options) (http.RoundTripper, error) {
 }
 
 type httpConnect struct {
+	address         string
 	id              int
 	connectedAt     time.Time
 	released        bool
@@ -294,6 +296,10 @@ func (h *httpConnect) serverVersion() (*ServerVersion, error) {
 
 func (h *httpConnect) connID() int {
 	return h.id
+}
+
+func (h *httpConnect) addr() string {
+	return h.address
 }
 
 func (h *httpConnect) connectedAtTime() time.Time {
