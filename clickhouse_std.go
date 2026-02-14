@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
 	chdriver "github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -59,6 +60,14 @@ func (o *stdConnOpener) Connect(ctx context.Context) (_ driver.Conn, err error) 
 		return nil, ErrAcquireConnNoAddress
 	}
 
+	backoffState := o.opt.addrDialBackoff
+	nowUnixNanos := int64(0)
+	probeAddrNum := -1
+	probeRetryAfter := int64(0)
+	if backoffState != nil {
+		nowUnixNanos = time.Now().UnixNano()
+	}
+
 	for i := range o.opt.Addr {
 		var num int
 		switch o.opt.ConnOpenStrategy {
@@ -70,7 +79,23 @@ func (o *stdConnOpener) Connect(ctx context.Context) (_ driver.Conn, err error) 
 			random := rand.Int()
 			num = (random + i) % len(o.opt.Addr)
 		}
+
+		if backoffState != nil {
+			retryAfter, ready := backoffState.ready(num, nowUnixNanos)
+			if !ready {
+				if probeAddrNum == -1 || retryAfter < probeRetryAfter {
+					probeAddrNum = num
+					probeRetryAfter = retryAfter
+				}
+				continue
+			}
+		}
+
 		if conn, err = dialFunc(ctx, o.opt.Addr[num], connID, o.opt); err == nil {
+			if backoffState != nil {
+				backoffState.markSuccess(num)
+			}
+
 			// Create a logger with connection-specific context
 			connLogger := o.logger.With(
 				slog.Int("conn_num", num),
@@ -80,14 +105,43 @@ func (o *stdConnOpener) Connect(ctx context.Context) (_ driver.Conn, err error) 
 				conn:   conn,
 				logger: connLogger,
 			}, nil
-		} else {
-			o.logger.Error("connection error",
-				slog.String("addr", o.opt.Addr[num]),
-				slog.Int("conn_id", connID),
-				slog.Any("error", err))
 		}
+
+		if backoffState != nil {
+			backoffState.markFailure(num, time.Now())
+		}
+
+		o.logger.Error("connection error",
+			slog.String("addr", o.opt.Addr[num]),
+			slog.Int("conn_id", connID),
+			slog.Any("error", err))
 	}
 
+	if backoffState != nil && probeAddrNum >= 0 {
+		if conn, err = dialFunc(ctx, o.opt.Addr[probeAddrNum], connID, o.opt); err == nil {
+			backoffState.markSuccess(probeAddrNum)
+
+			connLogger := o.logger.With(
+				slog.Int("conn_num", probeAddrNum),
+				slog.String("addr", o.opt.Addr[probeAddrNum]),
+			)
+			return &stdDriver{
+				conn:   conn,
+				logger: connLogger,
+			}, nil
+		}
+
+		backoffState.markFailure(probeAddrNum, time.Now())
+		o.logger.Error("connection error",
+			slog.String("addr", o.opt.Addr[probeAddrNum]),
+			slog.Int("conn_id", connID),
+			slog.Any("error", err))
+		return nil, err
+	}
+
+	if err == nil {
+		err = ErrAcquireConnNoAddress
+	}
 	return nil, err
 }
 

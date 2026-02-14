@@ -702,3 +702,214 @@ func TestAcquireRelease_PoolSaturation(t *testing.T) {
 		t.Error("expected to reuse released connection")
 	}
 }
+
+func TestDefaultDialStrategy_SkipsFailedAddressOnNextDial(t *testing.T) {
+	opt := (&Options{
+		Addr:             []string{"addr-1", "addr-2"},
+		AddrBackoff:      true,
+		ConnOpenStrategy: ConnOpenInOrder,
+	}).setDefaults()
+
+	var (
+		attemptAddr1 int
+		attemptAddr2 int
+	)
+
+	dial := func(ctx context.Context, addr string, opt *Options) (DialResult, error) {
+		switch addr {
+		case "addr-1":
+			attemptAddr1++
+			return DialResult{}, errors.New("addr-1 failed")
+		case "addr-2":
+			attemptAddr2++
+			return DialResult{}, nil
+		default:
+			t.Fatalf("unexpected address: %s", addr)
+			return DialResult{}, nil
+		}
+	}
+
+	if _, err := DefaultDialStrategy(context.Background(), 1, opt, dial); err != nil {
+		t.Fatalf("first dial failed: %v", err)
+	}
+	if _, err := DefaultDialStrategy(context.Background(), 2, opt, dial); err != nil {
+		t.Fatalf("second dial failed: %v", err)
+	}
+
+	if attemptAddr1 != 1 {
+		t.Fatalf("expected addr-1 to be attempted once after backoff, got %d", attemptAddr1)
+	}
+	if attemptAddr2 != 2 {
+		t.Fatalf("expected addr-2 to be attempted twice, got %d", attemptAddr2)
+	}
+}
+
+func TestDefaultDialStrategy_BackoffDisabledByDefault(t *testing.T) {
+	opt := (&Options{
+		Addr:             []string{"addr-1", "addr-2"},
+		ConnOpenStrategy: ConnOpenInOrder,
+	}).setDefaults()
+
+	var (
+		attemptAddr1 int
+		attemptAddr2 int
+	)
+
+	dial := func(ctx context.Context, addr string, opt *Options) (DialResult, error) {
+		switch addr {
+		case "addr-1":
+			attemptAddr1++
+			return DialResult{}, errors.New("addr-1 failed")
+		case "addr-2":
+			attemptAddr2++
+			return DialResult{}, nil
+		default:
+			t.Fatalf("unexpected address: %s", addr)
+			return DialResult{}, nil
+		}
+	}
+
+	if _, err := DefaultDialStrategy(context.Background(), 1, opt, dial); err != nil {
+		t.Fatalf("first dial failed: %v", err)
+	}
+	if _, err := DefaultDialStrategy(context.Background(), 2, opt, dial); err != nil {
+		t.Fatalf("second dial failed: %v", err)
+	}
+
+	if attemptAddr1 != 2 {
+		t.Fatalf("expected addr-1 to be attempted twice when backoff is disabled, got %d", attemptAddr1)
+	}
+	if attemptAddr2 != 2 {
+		t.Fatalf("expected addr-2 to be attempted twice when backoff is disabled, got %d", attemptAddr2)
+	}
+}
+
+func TestDefaultDialStrategy_DoesNotSkipSingleAddress(t *testing.T) {
+	opt := (&Options{
+		Addr: []string{"single-addr"},
+	}).setDefaults()
+
+	attempts := 0
+	dial := func(ctx context.Context, addr string, opt *Options) (DialResult, error) {
+		attempts++
+		return DialResult{}, errors.New("single address failed")
+	}
+
+	_, _ = DefaultDialStrategy(context.Background(), 1, opt, dial)
+	_, _ = DefaultDialStrategy(context.Background(), 2, opt, dial)
+
+	if attempts != 2 {
+		t.Fatalf("expected single address to be attempted on every dial, got %d", attempts)
+	}
+}
+
+func TestDefaultDialStrategy_RetriesAddressAfterBackoffWindow(t *testing.T) {
+	opt := (&Options{
+		Addr:             []string{"addr-1", "addr-2"},
+		AddrBackoff:      true,
+		ConnOpenStrategy: ConnOpenInOrder,
+	}).setDefaults()
+
+	var (
+		attemptAddr1 int
+		attemptAddr2 int
+		addr1Healthy bool
+	)
+
+	dial := func(ctx context.Context, addr string, opt *Options) (DialResult, error) {
+		switch addr {
+		case "addr-1":
+			attemptAddr1++
+			if !addr1Healthy {
+				return DialResult{}, errors.New("addr-1 failed")
+			}
+			return DialResult{}, nil
+		case "addr-2":
+			attemptAddr2++
+			return DialResult{}, nil
+		default:
+			t.Fatalf("unexpected address: %s", addr)
+			return DialResult{}, nil
+		}
+	}
+
+	if _, err := DefaultDialStrategy(context.Background(), 1, opt, dial); err != nil {
+		t.Fatalf("first dial failed: %v", err)
+	}
+	if _, err := DefaultDialStrategy(context.Background(), 2, opt, dial); err != nil {
+		t.Fatalf("second dial failed: %v", err)
+	}
+
+	addr1Healthy = true
+	opt.addrDialBackoff.entries[0].retryAfterUnixNanos.Store(time.Now().Add(-time.Millisecond).UnixNano())
+
+	if _, err := DefaultDialStrategy(context.Background(), 3, opt, dial); err != nil {
+		t.Fatalf("third dial failed: %v", err)
+	}
+
+	if attemptAddr1 != 2 {
+		t.Fatalf("expected addr-1 to be retried after backoff expiration, got %d attempts", attemptAddr1)
+	}
+	if attemptAddr2 != 2 {
+		t.Fatalf("expected addr-2 attempts to stop at 2, got %d", attemptAddr2)
+	}
+}
+
+func TestDefaultDialStrategy_ConcurrentBackoffState(t *testing.T) {
+	opt := (&Options{
+		Addr:             []string{"addr-1", "addr-2"},
+		AddrBackoff:      true,
+		ConnOpenStrategy: ConnOpenRoundRobin,
+	}).setDefaults()
+
+	var (
+		addr1Attempts atomic.Int64
+		connSeq       atomic.Int64
+	)
+
+	dial := func(ctx context.Context, addr string, opt *Options) (DialResult, error) {
+		switch addr {
+		case "addr-1":
+			attempt := addr1Attempts.Add(1)
+			if attempt%5 == 0 {
+				return DialResult{}, nil
+			}
+			return DialResult{}, errors.New("addr-1 failed")
+		case "addr-2":
+			return DialResult{}, nil
+		default:
+			return DialResult{}, errors.New("unexpected address")
+		}
+	}
+
+	const (
+		goroutines = 32
+		iterations = 200
+	)
+
+	errCh := make(chan error, goroutines*iterations)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				connID := int(connSeq.Add(1))
+				if _, err := DefaultDialStrategy(context.Background(), connID, opt, dial); err != nil {
+					errCh <- err
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("unexpected dial error: %v", err)
+	}
+
+	if addr1Attempts.Load() == 0 {
+		t.Fatal("expected addr-1 to be attempted during concurrent dialing")
+	}
+}

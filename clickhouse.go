@@ -39,6 +39,69 @@ var (
 	ErrConnectionClosed          = errors.New("clickhouse: connection is closed")
 )
 
+const (
+	defaultAddrDialBackoffMin = time.Second
+	defaultAddrDialBackoffMax = time.Second * 30
+)
+
+type addrDialBackoffEntry struct {
+	failures            atomic.Uint32
+	retryAfterUnixNanos atomic.Int64
+}
+
+type addrDialBackoffState struct {
+	minDelay time.Duration
+	maxDelay time.Duration
+	entries  []addrDialBackoffEntry
+}
+
+func newAddrDialBackoffState(addrCount int, minDelay, maxDelay time.Duration) *addrDialBackoffState {
+	if addrCount <= 1 {
+		return nil
+	}
+	if minDelay <= 0 {
+		minDelay = defaultAddrDialBackoffMin
+	}
+	if maxDelay < minDelay {
+		maxDelay = minDelay
+	}
+	return &addrDialBackoffState{
+		minDelay: minDelay,
+		maxDelay: maxDelay,
+		entries:  make([]addrDialBackoffEntry, addrCount),
+	}
+}
+
+func (s *addrDialBackoffState) ready(index int, nowUnixNanos int64) (retryAfter int64, ok bool) {
+	retryAfter = s.entries[index].retryAfterUnixNanos.Load()
+	return retryAfter, retryAfter <= nowUnixNanos
+}
+
+func (s *addrDialBackoffState) markFailure(index int, now time.Time) {
+	failures := s.entries[index].failures.Add(1)
+	delay := exponentialBackoffDelay(s.minDelay, s.maxDelay, failures)
+	s.entries[index].retryAfterUnixNanos.Store(now.Add(delay).UnixNano())
+}
+
+func (s *addrDialBackoffState) markSuccess(index int) {
+	s.entries[index].failures.Store(0)
+	s.entries[index].retryAfterUnixNanos.Store(0)
+}
+
+func exponentialBackoffDelay(minDelay, maxDelay time.Duration, failures uint32) time.Duration {
+	delay := minDelay
+	for attempt := uint32(1); attempt < failures; attempt++ {
+		if delay >= maxDelay/2 {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
 type OpError struct {
 	Op         string
 	ColumnName string
@@ -273,6 +336,15 @@ func (ch *clickhouse) dial(ctx context.Context) (conn nativeTransport, err error
 }
 
 func DefaultDialStrategy(ctx context.Context, connID int, opt *Options, dial Dial) (r DialResult, err error) {
+	backoffState := opt.addrDialBackoff
+	nowUnixNanos := int64(0)
+	probeAddrNum := -1
+	probeRetryAfter := int64(0)
+
+	if backoffState != nil {
+		nowUnixNanos = time.Now().UnixNano()
+	}
+
 	for i := range opt.Addr {
 		var num int
 		switch opt.ConnOpenStrategy {
@@ -285,9 +357,35 @@ func DefaultDialStrategy(ctx context.Context, connID int, opt *Options, dial Dia
 			num = (random + i) % len(opt.Addr)
 		}
 
+		if backoffState != nil {
+			retryAfter, ready := backoffState.ready(num, nowUnixNanos)
+			if !ready {
+				if probeAddrNum == -1 || retryAfter < probeRetryAfter {
+					probeAddrNum = num
+					probeRetryAfter = retryAfter
+				}
+				continue
+			}
+		}
+
 		if r, err = dial(ctx, opt.Addr[num], opt); err == nil {
+			if backoffState != nil {
+				backoffState.markSuccess(num)
+			}
 			return r, nil
 		}
+		if backoffState != nil {
+			backoffState.markFailure(num, time.Now())
+		}
+	}
+
+	if backoffState != nil && probeAddrNum >= 0 {
+		if r, err = dial(ctx, opt.Addr[probeAddrNum], opt); err == nil {
+			backoffState.markSuccess(probeAddrNum)
+			return r, nil
+		}
+		backoffState.markFailure(probeAddrNum, time.Now())
+		return r, err
 	}
 
 	if err == nil {

@@ -453,6 +453,35 @@ func TestParseDSN(t *testing.T) {
 			"",
 		},
 		{
+			"address backoff settings",
+			"clickhouse://127.0.0.1,test-2:9000/test_database?addr_backoff=true&addr_backoff_min=250ms&addr_backoff_max=5s",
+			&Options{
+				Protocol: Native,
+				Addr:     []string{"127.0.0.1", "test-2:9000"},
+				Settings: Settings{},
+				Auth: Auth{
+					Database: "test_database",
+				},
+				AddrBackoff:    true,
+				AddrBackoffMin: 250 * time.Millisecond,
+				AddrBackoffMax: 5 * time.Second,
+				scheme:         "clickhouse",
+			},
+			"",
+		},
+		{
+			"address backoff min invalid",
+			"clickhouse://127.0.0.1/test_database?addr_backoff_min=abc",
+			nil,
+			"addr_backoff_min invalid value: time: invalid duration \"abc\"",
+		},
+		{
+			"address backoff max invalid",
+			"clickhouse://127.0.0.1/test_database?addr_backoff_max=xyz",
+			nil,
+			"addr_backoff_max invalid value: time: invalid duration \"xyz\"",
+		},
+		{
 			"http protocol with proxy",
 			"http://127.0.0.1/?http_proxy=http%3A%2F%2Fproxy.example.com%3A3128",
 			&Options{
@@ -520,4 +549,17 @@ func parseURL(t *testing.T, v string) *url.URL {
 	u, err := url.Parse(v)
 	require.NoError(t, err)
 	return u
+}
+
+func TestOptionsSetDefaults_AddressBackoffConfig(t *testing.T) {
+	opt := (Options{
+		Addr:           []string{"127.0.0.1:9000", "127.0.0.1:9001"},
+		AddrBackoff:    true,
+		AddrBackoffMin: 150 * time.Millisecond,
+		AddrBackoffMax: 2 * time.Second,
+	}).setDefaults()
+
+	require.NotNil(t, opt.addrDialBackoff)
+	assert.Equal(t, 150*time.Millisecond, opt.addrDialBackoff.minDelay)
+	assert.Equal(t, 2*time.Second, opt.addrDialBackoff.maxDelay)
 }

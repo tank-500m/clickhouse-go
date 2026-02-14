@@ -154,6 +154,9 @@ type Options struct {
 	MaxIdleConns         int           // default 5
 	ConnMaxLifetime      time.Duration // default 1 hour
 	ConnOpenStrategy     ConnOpenStrategy
+	AddrBackoff          bool              // when true, temporarily skip failed addresses with exponential backoff
+	AddrBackoffMin       time.Duration     // minimum backoff delay for failed addresses
+	AddrBackoffMax       time.Duration     // maximum backoff delay for failed addresses
 	FreeBufOnConnRelease bool              // drop preserved memory buffer after each query
 	HttpHeaders          map[string]string // set additional headers on HTTP requests
 	HttpUrlPath          string            // set additional URL path for HTTP requests
@@ -170,6 +173,8 @@ type Options struct {
 	GetJWT GetJWTFunc
 
 	scheme string
+
+	addrDialBackoff *addrDialBackoffState
 
 	// ReadTimeout is the maximum duration the client will wait for ClickHouse
 	// to respond to a single Read call for bytes over the connection.
@@ -301,6 +306,24 @@ func (o *Options) fromDSN(in string) error {
 			case "random":
 				o.ConnOpenStrategy = ConnOpenRandom
 			}
+		case "addr_backoff":
+			enabled, parseErr := strconv.ParseBool(params.Get(v))
+			if parseErr != nil {
+				return fmt.Errorf("addr_backoff invalid value: %w", parseErr)
+			}
+			o.AddrBackoff = enabled
+		case "addr_backoff_min":
+			duration, parseErr := time.ParseDuration(params.Get(v))
+			if parseErr != nil {
+				return fmt.Errorf("addr_backoff_min invalid value: %w", parseErr)
+			}
+			o.AddrBackoffMin = duration
+		case "addr_backoff_max":
+			duration, parseErr := time.ParseDuration(params.Get(v))
+			if parseErr != nil {
+				return fmt.Errorf("addr_backoff_max invalid value: %w", parseErr)
+			}
+			o.AddrBackoffMax = duration
 		case "max_open_conns":
 			maxOpenConns, err := strconv.Atoi(params.Get(v))
 			if err != nil {
@@ -419,6 +442,9 @@ func (o Options) setDefaults() *Options {
 		case HTTP:
 			o.Addr = []string{"localhost:8123"}
 		}
+	}
+	if o.AddrBackoff {
+		o.addrDialBackoff = newAddrDialBackoffState(len(o.Addr), o.AddrBackoffMin, o.AddrBackoffMax)
 	}
 	return &o
 }
